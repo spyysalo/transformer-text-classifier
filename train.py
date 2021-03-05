@@ -98,11 +98,8 @@ def build_classifier(pretrained_model, num_labels, optimizer, options):
     seq_len = options.seq_len
     input_ids = Input(
         shape=(seq_len,), dtype='int32', name='input_ids')
-#    token_type_ids = Input(
-#        shape=(seq_len,), dtype='int32', name='token_type_ids')
     attention_mask = Input(
         shape=(seq_len,), dtype='int32', name='attention_mask')
-#    inputs = [input_ids, attention_mask, token_type_ids]
     inputs = [input_ids, attention_mask]
 
     pretrained_outputs = pretrained_model(inputs)
@@ -167,7 +164,6 @@ def make_tokenization_function(tokenizer, options):
         # dict mapping to transformer.BatchEncoding inputs
         return {
             'input_ids': tokenized['input_ids'],
-#            'token_type_ids': tokenized['token_type_ids'],
             'attention_mask': tokenized['attention_mask'],
         }
     return tokenize
