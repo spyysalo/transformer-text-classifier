@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 
+import os
 import sys
 import math
 
 from sklearn.preprocessing import MultiLabelBinarizer
 
 from tensorflow.keras import Model
+from tensorflow.keras.models import load_model
 from tensorflow.keras.layers import Input, Dropout, Dense
-from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import CategoricalCrossentropy, BinaryCrossentropy
 from tensorflow.keras.metrics import CategoricalAccuracy, AUC
 
 from tensorflow_addons.metrics import F1Score
 
 from transformers import AutoConfig, AutoTokenizer, TFAutoModel
+from transformers import AdamWeightDecay
 from transformers.optimization_tf import create_optimizer
 
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
@@ -56,15 +58,30 @@ def argparser():
                     help='input file format')
     ap.add_argument('--multiclass', default=False, action='store_true',
                     help='task has exactly one label per text')
+    ap.add_argument('--save_model', metavar='DIR', default=None,
+                    help='save trained model in DIR')
+    ap.add_argument('--cache_dir', default=None,
+                    help='transformers cache directory')
     return ap
 
 
 
+@timed
 def load_pretrained(options):
-    name = options.model_name
-    config = AutoConfig.from_pretrained(name)
-    tokenizer = AutoTokenizer.from_pretrained(name, config=config)
-    model = TFAutoModel.from_pretrained(name, config=config)
+    config = AutoConfig.from_pretrained(
+        options.model_name,
+        cache_dir=options.cache_dir
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        options.model_name,
+        config=config,
+        cache_dir=options.cache_dir
+    )
+    model = TFAutoModel.from_pretrained(
+        options.model_name,
+        config=config,
+        cache_dir=options.cache_dir
+    )
 
     if options.seq_len > config.max_position_embeddings:
         warning(f'--seq_len ({options.seq_len}) > max_position_embeddings '
@@ -94,7 +111,27 @@ def get_optimizer(num_train_examples, options):
     return optimizer
 
 
+def get_pretrained_model_main_layer(model):
+    # Transformers doesn't support saving models wrapped in keras
+    # (https://github.com/huggingface/transformers/issues/2733) at the
+    # time of this writing. As a workaround, use the main layer
+    # instead of the model. As the main layer has different names for
+    # different models (TFBertModel.bert, TFRobertaModel.roberta,
+    # etc.), this has to check which model we're dealing with.
+    from transformers import TFBertModel, TFRobertaModel
+
+    if isinstance(model, TFBertModel):
+        return model.bert
+    elif isinstance(model, TFRobertaModel):
+        return model.roberta
+    else:
+        raise NotImplementedError(f'{model.__class__.__name__}')
+
+
 def build_classifier(pretrained_model, num_labels, optimizer, options):
+    # workaround for lack of support for saving pretrained models
+    pretrained_model = get_pretrained_model_main_layer(pretrained_model)
+
     seq_len = options.seq_len
     input_ids = Input(
         shape=(seq_len,), dtype='int32', name='input_ids')
@@ -169,12 +206,30 @@ def make_tokenization_function(tokenizer, options):
     return tokenize
 
 
+def get_custom_objects():
+    """Return dictionary of custom objects required for load_model."""
+    return {
+        'AdamWeightDecay': AdamWeightDecay,
+    }
+
+
 @timed
 def prepare_classifier(num_train_examples, num_labels, options):
     pretrained_model, tokenizer, config = load_pretrained(options)
     optimizer = get_optimizer(num_train_examples, options)
     model = build_classifier(pretrained_model, num_labels, optimizer, options)
-    return model, tokenizer, optimizer
+    return model, tokenizer, optimizer, config
+
+
+@timed
+def save_trained_model(directory, model, tokenizer, labels, config):
+    os.makedirs(directory, exist_ok=True)
+    model.save(os.path.join(directory, 'model.hdf5'))
+    config.save_pretrained(directory)
+    tokenizer.save_pretrained(directory)
+    with open(os.path.join(directory, 'labels.txt'), 'w') as out:
+        for label in labels:
+            print(label, file=out)
 
 
 def main(argv):
@@ -190,7 +245,7 @@ def main(argv):
     dev_Y = label_encoder.transform(dev_labels)
     num_labels = len(label_encoder.classes_)
 
-    classifier, tokenizer, optimizer = prepare_classifier(
+    classifier, tokenizer, optimizer, config = prepare_classifier(
         num_train_examples,
         num_labels,
         options
@@ -207,6 +262,10 @@ def main(argv):
         batch_size=options.batch_size,
         validation_data=(dev_X, dev_Y),
     )
+
+    if options.save_model is not None:
+        save_trained_model(options.save_model, classifier, tokenizer,
+                           label_encoder.classes_, config)
 
     return 0
 
