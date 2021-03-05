@@ -117,6 +117,7 @@ def build_classifier(pretrained_model, num_labels, optimizer, options):
         output = Dense(num_labels, activation='sigmoid')(pooled_output)
         loss = BinaryCrossentropy()
         metrics = [
+            CategoricalAccuracy(name='acc'),
             F1Score(name='f1', num_classes=num_labels, average='micro',
                     threshold=0.5),
             AUC(name='auc', multi_label=True)
