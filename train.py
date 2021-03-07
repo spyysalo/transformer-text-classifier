@@ -15,14 +15,13 @@ from tensorflow.keras.metrics import CategoricalAccuracy, AUC
 from tensorflow_addons.metrics import F1Score
 
 from transformers import AutoConfig, AutoTokenizer, TFAutoModel
-from transformers import AdamWeightDecay
 from transformers.optimization_tf import create_optimizer
 
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from logging import warning
 
 from readers import READERS, get_reader
-from common import timed
+from common import timed, load_data, make_tokenization_function
 
 
 # Parameter defaults
@@ -87,6 +86,7 @@ def load_pretrained(options):
         warning(f'--seq_len ({options.seq_len}) > max_position_embeddings '
                 f'({config.max_position_embeddings}), using latter')
         options.seq_len = config.max_position_embeddings
+    config.seq_len = options.seq_len
 
     return model, tokenizer, config
 
@@ -146,7 +146,10 @@ def build_classifier(pretrained_model, num_labels, optimizer, options):
     if options.multiclass:
         output = Dense(num_labels, activation='softmax')(pooled_output)
         loss = CategoricalCrossentropy()
-        metrics = [CategoricalAccuracy(name='acc')]
+        metrics = [
+            CategoricalAccuracy(name='acc'),
+            AUC(name='auc', multi_label=False),
+        ]
     else:
         output = Dense(num_labels, activation='sigmoid')(pooled_output)
         loss = BinaryCrossentropy()
@@ -154,7 +157,7 @@ def build_classifier(pretrained_model, num_labels, optimizer, options):
             CategoricalAccuracy(name='acc'),
             F1Score(name='f1', num_classes=num_labels, average='micro',
                     threshold=0.5),
-            AUC(name='auc', multi_label=True)
+            AUC(name='auc', multi_label=True),
         ]
         
     model = Model(
@@ -169,48 +172,6 @@ def build_classifier(pretrained_model, num_labels, optimizer, options):
     )
 
     return model
-
-
-@timed
-def load_data(fn, options):
-    read = get_reader(options.input_format)
-    texts, labels = [], []
-    with open(fn) as f:
-        for ln, (text, text_labels) in enumerate(read(f, fn), start=1):
-            if options.multiclass and not text_labels:
-                raise ValueError(f'missing label on line {ln} in {fn}: {l}')
-            elif options.multiclass and len(text_labels) > 1:
-                raise ValueError(f'multiple labels on line {ln} in {fn}: {l}')
-            texts.append(text)
-            labels.append(text_labels)
-    print(f'loaded {len(texts)} examples from {fn}', file=sys.stderr)
-    return texts, labels
-
-
-def make_tokenization_function(tokenizer, options):
-    seq_len = options.seq_len
-    def tokenize(text):
-        tokenized = tokenizer(
-            text,
-            max_length=seq_len,
-            truncation=True,
-            padding=True,
-            return_tensors='np'
-        )
-        # Return dict b/c Keras (2.3.0-tf) DataAdapter doesn't apply
-        # dict mapping to transformer.BatchEncoding inputs
-        return {
-            'input_ids': tokenized['input_ids'],
-            'attention_mask': tokenized['attention_mask'],
-        }
-    return tokenize
-
-
-def get_custom_objects():
-    """Return dictionary of custom objects required for load_model."""
-    return {
-        'AdamWeightDecay': AdamWeightDecay,
-    }
 
 
 @timed
@@ -235,8 +196,10 @@ def save_trained_model(directory, model, tokenizer, labels, config):
 def main(argv):
     options = argparser().parse_args(argv[1:])
 
-    train_texts, train_labels = load_data(options.train, options)
-    dev_texts, dev_labels = load_data(options.dev, options)
+    train_texts, train_labels = load_data(
+        options.train, options.input_format, options.multiclass)
+    dev_texts, dev_labels = load_data(
+        options.dev, options.input_format, options.multiclass)
     num_train_examples = len(train_texts)
     
     label_encoder = MultiLabelBinarizer()
@@ -250,8 +213,9 @@ def main(argv):
         num_labels,
         options
     )
+    config.multiclass = options.multiclass
 
-    tokenize = make_tokenization_function(tokenizer, options)
+    tokenize = make_tokenization_function(tokenizer, options.seq_len)
     train_X = tokenize(train_texts)
     dev_X = tokenize(dev_texts)
 
@@ -262,6 +226,14 @@ def main(argv):
         batch_size=options.batch_size,
         validation_data=(dev_X, dev_Y),
     )
+
+    metrics_values = classifier.evaluate(
+        dev_X,
+        dev_Y,
+        batch_size=options.batch_size
+    )
+    for name, value in zip(classifier.metrics_names, metrics_values):
+        print(f'{name}\t{value}')
 
     if options.save_model is not None:
         save_trained_model(options.save_model, classifier, tokenizer,
